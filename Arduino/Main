@@ -1,0 +1,327 @@
+#include <Wire.h>
+#include <M5Atom.h>
+#include <elapsedMillis.h>
+#include <APA102.h>
+#include <Adafruit_BNO08x.h>
+#include <Midi.h>
+#include "AudioTools.h"
+#include "AudioTools/AudioLibs/AudioBoardStream.h"
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h> // customized to prevent namespace conflict when usin async (ALL THE HTTP_XXX NOW = ASYNC_HTTP_XXX)
+#include <SPIFFS.h>
+
+
+// --- Audio configuration --- //
+#define SAMPLE_RATE 44100
+#define CHANNELS 1
+#define BITS_PER_SAMPLE 16
+#define SINE_FREQUENCY 125  // 125Hz for yellow tac-hammer
+
+// --- Audio objects --- //
+SineWaveGenerator<int16_t> sineWave;
+PinkNoiseGenerator<int16_t> pinkNoise;
+ADSRGain adsr(0.9f, 0.9f, 1.0f, 0.9f); // ultra short attack/decay/release & max sustain 
+I2SStream i2s;
+GeneratedSoundStream<int16_t> sine(sineWave);
+GeneratedSoundStream<int16_t> noise(pinkNoise);
+VolumeStream noiseGain(noise);
+InputMixer<int16_t> mixer;
+AudioEffectStream effects(mixer);
+StreamCopy copier(i2s, effects);
+
+// --- Headset ID Number --- // 
+int idNum = 1;
+
+// --- ADSR Parameters --- //
+float attackTime = 0.9f; // shortest = 1 | longest = 0.0001
+float decayTime = 0.9f;
+float sustainLevel = 1.0f;
+float releaseTime = 0.9f;
+
+// --- Sine volume control --- //
+bool isPlaying = false; // Flag to track if soundstream is playing
+const int16_t MAX_VOLUME = 30000;  // Max amplitude = 32 767 (without clipping when on battery = ~30 000) also used for noise
+// --- Pink noise volume control --- //
+bool isNoisePlaying = false; // Flag to track if noise is playing
+
+// --- delta variables --- //
+float deltaThresh = 10.0f; // < adjust at taste (5-20 for imu) OLD METHOD for (cumulative delta)
+long deltaCurrentX, deltaCurrentY, deltaCurrentZ = 0.0;
+long cumulativeDeltaX, cumulativeDeltaY, cumulativeDeltaZ = 0;
+double prev_imu_x, prev_imu_y, prev_imu_z = 0.0;
+double delta_imu_x, delta_imu_y, delta_imu_z = 0.0;
+
+// --- Quantized trigger --- //
+float rangeMin = 0.0f;           // or -180.0f, based on your range
+float rangeMax = 360.0f;         // or 180.0f
+float triggerSpacing = 8.0f;    // degrees between each trigger (5-10 seems good)
+
+int totalBins = (rangeMax - rangeMin) / triggerSpacing;
+
+static int lastTriggerBinX = -1;  // store last triggered bin
+static int lastTriggerBinY = -1;  // store last triggered bin
+static int lastTriggerBinZ = -1;  // store last triggered bin
+
+
+// --- IMU --- //
+#ifdef FAST_MODE
+  // Top frequency is reported to be 1000Hz (but freq is somewhat variable)
+  sh2_SensorId_t reportType = SH2_GYRO_INTEGRATED_RV;
+  long reportIntervalUs = 2000;
+#else
+  // Top frequency is about 250Hz but this report is more accurate
+  sh2_SensorId_t reportType = SH2_ARVR_STABILIZED_RV;
+  long reportIntervalUs = 5000;
+#endif
+
+#define BNO08X_RESET -1
+Adafruit_BNO08x  bno08x(BNO08X_RESET);
+sh2_SensorValue_t sensorValue;
+
+struct euler_t {
+  float yaw;
+  float pitch;
+  float roll;
+} ypr;
+
+float imu_x, imu_y, imu_z;
+float accel_x, accel_y, accel_z;
+
+// Variables to track angle for each axis
+float prevAngle_x = 0.0f, prevAngle_y = 0.0f, prevAngle_z = 0.0f;
+float totalAngle_x = 0.0f, totalAngle_y = 0.0f, totalAngle_z = 0.0f;
+bool isFirstReading = true;  // Flag for the first reading
+
+void quaternionToEuler(float qr, float qi, float qj, float qk, euler_t* ypr, bool degrees = false) {
+
+    float sqr = sq(qr);
+    float sqi = sq(qi);
+    float sqj = sq(qj);
+    float sqk = sq(qk);
+
+    ypr->yaw = atan2(2.0 * (qi * qj + qk * qr), (sqi - sqj - sqk + sqr));
+    ypr->pitch = asin(-2.0 * (qi * qk - qj * qr) / (sqi + sqj + sqk + sqr));
+    ypr->roll = atan2(2.0 * (qj * qk + qi * qr), (-sqi - sqj + sqk + sqr));
+
+    if (degrees) {
+      ypr->yaw *= RAD_TO_DEG;
+      ypr->pitch *= RAD_TO_DEG;
+      ypr->roll *= RAD_TO_DEG;
+    }
+}
+
+void quaternionToEulerRV(sh2_RotationVectorWAcc_t* rotational_vector, euler_t* ypr, bool degrees = false) {
+    quaternionToEuler(rotational_vector->real, rotational_vector->i, rotational_vector->j, rotational_vector->k, ypr, degrees);
+}
+
+// --- LEDS --- //
+const uint8_t dataPin = 26;
+const uint8_t clockPin = 32;
+const uint16_t ledCount = 4;
+float brightness = 0.0f;
+rgb_color colors[ledCount];
+
+Pololu::APA102<dataPin, clockPin> ledStrip;
+
+// --- grain gen variables --- // 
+int freqOut = SINE_FREQUENCY;
+int16_t sineVolume = MAX_VOLUME;
+float noiseVolume = 0.0;
+bool isVibrating, shouldVibrate = false;
+uint32_t signalDuration;
+
+elapsedMicros pulseTimeUS = 0;
+
+// --- Print & Record variables --- //
+int printRefreshRate = 10 * 1000; // < Print time in microseconds - 10ms / 100Hz
+unsigned long previousPrintMicros = 0;
+bool debugPrint = true; //  << DEBUG ON/OFF
+
+// --- Setup --- //
+void setup() {
+  millis();
+  Serial.begin(115200);
+  M5.begin(true, false, true); // serial enable, i2c enable, display enable
+  M5.dis.drawpix(0, 0xff8700); // LED orange while setup
+  Wire.begin(32, 26); // sda, scl 
+  Serial.println("Beep boop, starting up");
+  delay(100);
+  // --- Init IMU --- //
+  Serial.println("Initializing BNO08x IMU...");
+  // Try to initialize!
+  if (!bno08x.begin_I2C()) {
+    Serial.println("Failed to find BNO08x chip");
+    // Flash red/blue to indicate IMU failure
+    for (int i = 0; i < 3; i++) {
+      M5.dis.drawpix(0, 0xff00ff);
+      delay(200);
+      M5.dis.drawpix(0, 0x000000);
+      delay(200);
+    }
+  } else {
+    Serial.println("BNO08x Found!");
+    setReports(reportType, reportIntervalUs);
+  }
+  //bno08x.enableReport(SH2_ACCELEROMETER, reportIntervalUs); // enable bno accel reports 
+  bno08x.enableReport(SH2_ARVR_STABILIZED_RV, reportIntervalUs); // enable bno orientation reports
+  delay(100);
+  M5.dis.drawpix(0, 0x01ff00); // init complete, green led 
+  Serial.println("Setup complete. Have a nice day boss :)");
+  delay(100);
+}
+
+// --- loop --- //
+void loop() {
+  const unsigned long nowMicros = micros();
+  M5.update();
+
+  // --- IMU readings ---
+  while (bno08x.getSensorEvent(&sensorValue)) {
+
+    switch (sensorValue.sensorId) {
+
+      case SH2_ARVR_STABILIZED_RV:
+        quaternionToEulerRV(&sensorValue.un.arvrStabilizedRV, &ypr, true);
+        imu_x = ypr.yaw;
+        imu_y = ypr.pitch;
+        imu_z = ypr.roll;
+        break;
+
+      case SH2_ACCELEROMETER:
+        accel_x = sensorValue.un.accelerometer.x;
+        accel_y = sensorValue.un.accelerometer.y;
+        accel_z = sensorValue.un.accelerometer.z;
+        break;
+    }
+  }
+
+  // --- Serial print ---
+  if (debugPrint && (nowMicros - previousPrintMicros >= printRefreshRate)) {
+    Serial.printf(
+      "%i,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+      idNum, imu_x, imu_y, imu_z,
+      accel_x, accel_y, accel_z
+    );
+    previousPrintMicros = nowMicros;
+  }
+  
+  delay(1);
+}
+
+
+/////////////////////////////////////////
+//     FUNCTIONS FOR GRAIN FEEDBACK    //
+/////////////////////////////////////////
+
+void GenerateGrain(float freq, bool* vibrateFlag, int16_t* amplitude_value, float* noise_amp) {
+  signalDuration = 1000 * 1000 / freq;  // in µs
+
+  if (isVibrating && (pulseTimeUS >= signalDuration)) { // stop pulse if flag on & time >= 1 wavelength
+    StopPulse();
+  }
+
+  if (*vibrateFlag == true) {
+    if (isVibrating && (pulseTimeUS >= signalDuration)) { // emergency stop ? not sureif it actually help with anything... 
+      StopPulse();
+    }
+    if(pulseTimeUS >=  signalDuration) {
+      StartPulse(freqOut, amplitude_value, noise_amp);
+      *vibrateFlag = false;
+    }
+  }
+}
+
+void StartPulse(float freq, int16_t* amplitude_value, float* noise_amp) {
+  isPlaying = true;
+  adsr.keyOn();
+  //sineWave.setAmplitude(*amplitude_value);
+  //noiseGain.setVolume(*noise_amp);
+  sineWave.setFrequency(freq);
+  M5.dis.drawpix(0, 0x0000ff);  // Blue when grain out
+  isVibrating = true;
+  pulseTimeUS = 0;
+}
+
+void StopPulse() {
+  //isPlaying = false; // << last change
+  adsr.keyOff();
+  //sineWave.setAmplitude(0);
+  //noiseGain.setVolume(0.0);
+  M5.dis.drawpix(0, 0xff0000); // Red when stop
+  isVibrating = false;
+  M5.dis.drawpix(0, 0x01ff00); // green led when idle
+  pulseTimeUS = 0;
+}
+
+void generateQuantizedTrigger(float imuAngle, int& lastTriggerBin) {
+    // Normalize angle to [rangeMin, rangeMax)
+    float angle = fmod((imuAngle - rangeMin + 360.0f), 360.0f) + rangeMin;
+    
+    // Calculate current bin
+    int currentBin = (int)((angle - rangeMin) / triggerSpacing);
+
+    // Trigger only if new bin is entered
+    if (currentBin != lastTriggerBin) {
+        shouldVibrate = true;
+        lastTriggerBin = currentBin;
+    }
+}
+
+///////////////////////////////
+//     FUNCTION FOR IMU      //
+///////////////////////////////
+
+void setReports(sh2_SensorId_t reportType, long report_interval) {
+  Serial.println("Setting desired reports");
+  if (! bno08x.enableReport(reportType, report_interval)) {
+    Serial.println("Could not enable stabilized remote vector");
+  }
+}
+
+float fmap(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+void quaternionToEulerGI(sh2_GyroIntegratedRV_t* rotational_vector, euler_t* ypr, bool degrees = false) {
+    quaternionToEuler(rotational_vector->real, rotational_vector->i, rotational_vector->j, rotational_vector->k, ypr, degrees);
+}
+
+float mapAngle(float input) {
+  return fmap(input, -180.0, 180.0, 0.0, 1.0);
+}
+
+// Function to update all three axes
+void updateTotalAngles(float current_x, float current_y, float current_z) {
+  // Skip the first reading comparison, just initialize
+  if (isFirstReading) {
+    prevAngle_x = current_x;
+    prevAngle_y = current_y;
+    prevAngle_z = current_z;
+    isFirstReading = false;
+    return;
+  }
+  
+  // Update X-axis
+  float diff_x = current_x - prevAngle_x;
+  if (diff_x > 180) diff_x -= 360;
+  else if (diff_x < -180) diff_x += 360;
+  totalAngle_x += diff_x;
+  prevAngle_x = current_x;
+  
+  // Update Y-axis
+  float diff_y = current_y - prevAngle_y;
+  if (diff_y > 180) diff_y -= 360;
+  else if (diff_y < -180) diff_y += 360;
+  totalAngle_y += diff_y;
+  prevAngle_y = current_y;
+  
+  // Update Z-axis
+  float diff_z = current_z - prevAngle_z;
+  if (diff_z > 180) diff_z -= 360;
+  else if (diff_z < -180) diff_z += 360;
+  totalAngle_z += diff_z;
+  prevAngle_z = current_z;
+}
+
+//   s e e   u   c y b e r s p a c e   c o w b o y   //
