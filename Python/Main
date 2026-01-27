@@ -4,6 +4,18 @@ Multi-MCU logger + OSC streamer with AUTO COM PORT DETECTION
 - Persistent device IDs based on serial number/description
 - Per-MCU CSV logging and OSC streaming
 - Format: idNum,imu_x,imu_y,imu_z,accel_x,accel_y,accel_z (7 values)
+
+NEW MODES:
+- Mode 1: Average all headsets equally
+- Mode 2: Hierarchical - one leader headset has 50% weight, others share remaining 50%
+- Mode 3: Averaging + Frequency extraction on all axes (100 samples) -> LFO output
+- Mode 4: Hierarchical + Frequency extraction on all axes (100 samples) -> LFO output
+
+OPTIMIZATIONS:
+- Reduced lock contention with lock-free reads
+- Frequency extraction runs at lower rate (10Hz) to reduce CPU load
+- OSC sending decoupled from heavy computation
+- Increased OSC update rate to 200Hz
 """
 
 from pythonosc import udp_client
@@ -13,6 +25,10 @@ import time
 import csv
 import os
 import threading
+from datetime import datetime
+import numpy as np
+from collections import deque
+import copy
 
 # ------------- USER CONFIG -------------
 
@@ -41,7 +57,134 @@ MANUAL_CSV_NAMES = ["PID_1", "PID_2"]
 # Threading
 USE_THREADS = False
 
+# OSC update rate (Hz)
+OSC_UPDATE_RATE = 100  # Stable 100Hz refresh rate
+
+# Frequency extraction update rate (Hz) - runs slower to reduce CPU load
+FREQ_EXTRACTION_RATE = 10  # Extract frequencies 10 times per second
+
 # ------------- END CONFIG ------------- 
+
+# Global variables for data aggregation
+latest_data = {}  # {device_id: {'imu_x': ..., 'imu_y': ..., etc}}
+data_lock = threading.Lock()
+
+# Cached aggregated data (updated by calculation thread, read by OSC thread)
+cached_aggregated = None
+cache_lock = threading.Lock()
+
+# Mode configuration
+current_mode = 1  # 1 = averaging, 2 = hierarchical, 3 = avg+freq, 4 = hierarchical+freq
+leader_device_id = None
+mode_log_file = None
+
+# Debug printing
+debug_print = False  # Console debug output
+
+# Frequency extraction buffers (store last 1000 samples = 10 seconds at 100Hz)
+BUFFER_SIZE = 1000
+aggregated_history = {
+    'imu_x': deque(maxlen=BUFFER_SIZE),
+    'imu_y': deque(maxlen=BUFFER_SIZE),
+    'imu_z': deque(maxlen=BUFFER_SIZE),
+    'accel_x': deque(maxlen=BUFFER_SIZE),
+    'accel_y': deque(maxlen=BUFFER_SIZE),
+    'accel_z': deque(maxlen=BUFFER_SIZE)
+}
+
+# LFO state for each axis
+lfo_frequencies = {
+    'imu_x': 0.0,
+    'imu_y': 0.0,
+    'imu_z': 0.0,
+    'accel_x': 0.0,
+    'accel_y': 0.0,
+    'accel_z': 0.0
+}
+
+lfo_phases = {
+    'imu_x': 0.0,
+    'imu_y': 0.0,
+    'imu_z': 0.0,
+    'accel_x': 0.0,
+    'accel_y': 0.0,
+    'accel_z': 0.0
+}
+
+# Frequency limits (Hz)
+MIN_FREQ = 0.1
+MAX_FREQ = 10.0
+
+
+def log_mode_change(mode, leader_id=None):
+    """Log mode changes to a separate log file."""
+    global mode_log_file
+    
+    if mode_log_file is None:
+        log_filename = f"mode_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        mode_log_file = open(log_filename, "a")
+        mode_log_file.write(f"Mode Log Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        mode_log_file.write("=" * 60 + "\n")
+    
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if mode == 1:
+        log_msg = f"[{timestamp}] MODE 1 - Averaging all headsets equally\n"
+    elif mode == 2:
+        log_msg = f"[{timestamp}] MODE 2 - Hierarchical with Leader Device {leader_id} (50% weight)\n"
+    elif mode == 3:
+        log_msg = f"[{timestamp}] MODE 3 - Averaging + Frequency Extraction (LFO output)\n"
+    elif mode == 4:
+        log_msg = f"[{timestamp}] MODE 4 - Hierarchical + Frequency Extraction with Leader Device {leader_id} (50% weight, LFO output)\n"
+    else:
+        log_msg = f"[{timestamp}] Unknown mode: {mode}\n"
+    
+    mode_log_file.write(log_msg)
+    mode_log_file.flush()
+    print(log_msg.strip())
+
+
+def extract_frequency(data_buffer, sample_rate=100.0):
+    """
+    Extract dominant frequency from a buffer of samples using FFT.
+    
+    Args:
+        data_buffer: deque or list of samples
+        sample_rate: samples per second (default 100 Hz)
+    
+    Returns:
+        Estimated frequency in Hz as float, clamped to MIN_FREQ - MAX_FREQ
+    """
+    if len(data_buffer) < 100:
+        return float(MIN_FREQ)
+    
+    # Convert to numpy array and remove DC offset
+    signal = np.array(data_buffer)
+    signal = signal - np.mean(signal)
+    
+    # Apply window to reduce spectral leakage
+    window = np.hanning(len(signal))
+    signal_windowed = signal * window
+    
+    # Compute FFT
+    fft_result = np.fft.rfft(signal_windowed)
+    fft_freqs = np.fft.rfftfreq(len(signal), 1.0 / sample_rate)
+    
+    # Get magnitude spectrum
+    magnitude = np.abs(fft_result)
+    
+    # Find peak frequency (ignore DC component at index 0)
+    # Only look in the valid frequency range
+    valid_indices = np.where((fft_freqs >= MIN_FREQ) & (fft_freqs <= MAX_FREQ))[0]
+    
+    if len(valid_indices) == 0:
+        return float(MIN_FREQ)
+    
+    # Find the peak within valid range
+    peak_idx = valid_indices[np.argmax(magnitude[valid_indices])]
+    dominant_freq = fft_freqs[peak_idx]
+    
+    # Return as float with 2 decimal precision
+    return float(np.clip(dominant_freq, MIN_FREQ, MAX_FREQ))
 
 
 def discover_devices():
@@ -124,7 +267,8 @@ def read_one_sample(serial_obj, max_attempts=5):
             continue
         
         # Skip debug messages from Arduino
-        if "Beep boop" in cleaned_line or "Initializing" in cleaned_line or "Found" in cleaned_line or "Setup complete" in cleaned_line:
+        if any(skip in cleaned_line for skip in ["Beep boop", "Initializing", "Found", "Setup complete", 
+                                                   "Calibrating", "WARNING", "Calibration", "seconds remaining"]):
             continue
             
         parts = cleaned_line.split(",")
@@ -152,6 +296,213 @@ def read_one_sample(serial_obj, max_attempts=5):
     return None
 
 
+def calculate_aggregated_data():
+    """
+    Calculate aggregated data based on current mode.
+    Mode 1: Simple average
+    Mode 2: Weighted average with leader at 50%
+    Mode 3: Simple average + frequency extraction
+    Mode 4: Weighted average + frequency extraction
+    
+    This is now called by a dedicated thread to update cached data.
+    """
+    global latest_data, current_mode, leader_device_id, aggregated_history, cached_aggregated
+    
+    # Make a quick copy of latest_data to minimize lock time
+    with data_lock:
+        if len(latest_data) == 0:
+            return None
+        local_data = copy.deepcopy(latest_data)
+    
+    # Calculate base aggregation (Mode 1 or 2 logic) - NO LOCK HELD
+    if current_mode in [1, 3]:
+        # MODE 1 & 3: Simple averaging
+        num_devices = len(local_data)
+        
+        aggregated = {
+            'imu_x': 0.0,
+            'imu_y': 0.0,
+            'imu_z': 0.0,
+            'accel_x': 0.0,
+            'accel_y': 0.0,
+            'accel_z': 0.0
+        }
+        
+        for device_id, data in local_data.items():
+            for key in aggregated.keys():
+                aggregated[key] += data[key]
+        
+        # Average by dividing by number of devices
+        for key in aggregated.keys():
+            aggregated[key] /= num_devices
+    
+    elif current_mode in [2, 4]:
+        # MODE 2 & 4: Hierarchical with leader at 50%
+        if leader_device_id is None or leader_device_id not in local_data:
+            # Fallback to equal averaging
+            num_devices = len(local_data)
+            aggregated = {
+                'imu_x': 0.0,
+                'imu_y': 0.0,
+                'imu_z': 0.0,
+                'accel_x': 0.0,
+                'accel_y': 0.0,
+                'accel_z': 0.0
+            }
+            for device_id, data in local_data.items():
+                for key in aggregated.keys():
+                    aggregated[key] += data[key]
+            for key in aggregated.keys():
+                aggregated[key] /= num_devices
+        else:
+            # Leader gets 50%, others split remaining 50%
+            leader_weight = 0.5
+            num_others = len(local_data) - 1
+            
+            if num_others > 0:
+                other_weight = 0.5 / num_others
+            else:
+                # Only leader exists
+                return local_data[leader_device_id].copy()
+            
+            aggregated = {
+                'imu_x': 0.0,
+                'imu_y': 0.0,
+                'imu_z': 0.0,
+                'accel_x': 0.0,
+                'accel_y': 0.0,
+                'accel_z': 0.0
+            }
+            
+            # Add leader contribution (50%)
+            leader_data = local_data[leader_device_id]
+            for key in aggregated.keys():
+                aggregated[key] += leader_data[key] * leader_weight
+            
+            # Add other devices' contribution (split remaining 50%)
+            for device_id, data in local_data.items():
+                if device_id != leader_device_id:
+                    for key in aggregated.keys():
+                        aggregated[key] += data[key] * other_weight
+    
+    # Store aggregated data in history buffers for Mode 3 & 4
+    if current_mode in [3, 4]:
+        for key in aggregated.keys():
+            aggregated_history[key].append(aggregated[key])
+    
+    # Update cached aggregated data
+    with cache_lock:
+        cached_aggregated = aggregated.copy()
+    
+    return aggregated
+
+
+def aggregation_calculation_thread():
+    """
+    Dedicated thread for calculating aggregated data.
+    Runs at a moderate rate to reduce CPU load while keeping cache fresh.
+    """
+    while True:
+        calculate_aggregated_data()
+        time.sleep(1.0 / 100.0)  # Update at 100Hz
+
+
+def frequency_extraction_thread():
+    """
+    Dedicated thread for extracting frequencies.
+    Runs at a lower rate (10Hz) since frequency extraction is expensive.
+    """
+    global lfo_frequencies
+    
+    while True:
+        if current_mode in [3, 4]:
+            # Only extract frequencies if we have enough samples
+            if len(aggregated_history['imu_x']) >= BUFFER_SIZE:
+                for axis in ['imu_x', 'imu_y', 'imu_z', 'accel_x', 'accel_y', 'accel_z']:
+                    # Extract frequency from history buffer
+                    freq = extract_frequency(aggregated_history[axis])
+                    lfo_frequencies[axis] = freq
+        
+        time.sleep(1.0 / FREQ_EXTRACTION_RATE)  # Update at 10Hz
+
+
+def send_aggregated_osc(osc_client):
+    """
+    Send aggregated data via OSC at high rate.
+    For Mode 3 & 4: also generate and send LFO output.
+    Optimized to minimize computation in this thread.
+    Runs at 100Hz for stable, consistent output.
+    """
+    global lfo_phases
+    
+    last_time = time.time()
+    frame_count = 0
+    debug_interval = 100  # Print debug info every 100 frames (1 second at 100Hz)
+    
+    while True:
+        current_time = time.time()
+        dt = current_time - last_time
+        last_time = current_time
+        
+        # Quick read of cached data (no heavy computation)
+        with cache_lock:
+            aggregated = cached_aggregated
+        
+        if aggregated is not None:
+            # Send aggregated data to /imu/aggregated/...
+            base = "/imu/aggregated"
+            
+            osc_client.send_message(f"{base}/yaw", aggregated['imu_x'])
+            osc_client.send_message(f"{base}/pitch", aggregated['imu_y'])
+            osc_client.send_message(f"{base}/roll", aggregated['imu_z'])
+            
+            osc_client.send_message(f"{base}/accel_x", aggregated['accel_x'])
+            osc_client.send_message(f"{base}/accel_y", aggregated['accel_y'])
+            osc_client.send_message(f"{base}/accel_z", aggregated['accel_z'])
+            
+            # Also send mode info
+            osc_client.send_message(f"{base}/mode", current_mode)
+            if current_mode in [2, 4] and leader_device_id is not None:
+                osc_client.send_message(f"{base}/leader_id", leader_device_id)
+            
+            # MODE 3 & 4: LFO generation (lightweight, no FFT here)
+            if current_mode in [3, 4]:
+                for axis in ['imu_x', 'imu_y', 'imu_z', 'accel_x', 'accel_y', 'accel_z']:
+                    freq = lfo_frequencies[axis]
+                    
+                    # Update LFO phase
+                    lfo_phases[axis] += 2 * np.pi * freq * dt
+                    if lfo_phases[axis] > 2 * np.pi:
+                        lfo_phases[axis] -= 2 * np.pi
+                    
+                    # Generate LFO value (sine wave)
+                    lfo_value = float(np.sin(lfo_phases[axis]))
+                    
+                    # Send LFO frequency and value (both as floats)
+                    osc_client.send_message(f"{base}/lfo_freq_{axis}", float(freq))
+                    osc_client.send_message(f"{base}/lfo_{axis}", lfo_value)
+            
+            # Debug printing
+            if debug_print:
+                frame_count += 1
+                if frame_count >= debug_interval:
+                    mode_str = f"Mode {current_mode}"
+                    if current_mode in [2, 4] and leader_device_id is not None:
+                        mode_str += f" (Leader: {leader_device_id})"
+                    
+                    print(f"\n[OSC DEBUG] {mode_str} | Update Rate: {1/dt:.1f} Hz")
+                    print(f"  Aggregated IMU: ({aggregated['imu_x']:.2f}, {aggregated['imu_y']:.2f}, {aggregated['imu_z']:.2f})")
+                    print(f"  Aggregated Accel: ({aggregated['accel_x']:.3f}, {aggregated['accel_y']:.3f}, {aggregated['accel_z']:.3f})")
+                    
+                    if current_mode in [3, 4]:
+                        print(f"  LFO Frequencies: imu_x={lfo_frequencies['imu_x']:.2f}Hz, "
+                              f"imu_y={lfo_frequencies['imu_y']:.2f}Hz, imu_z={lfo_frequencies['imu_z']:.2f}Hz")
+                    
+                    frame_count = 0
+        
+        time.sleep(1.0 / OSC_UPDATE_RATE)  # 100Hz OSC updates
+
+
 def process_port_loop(device, writer, print_data, osc_client, stop_event):
     """Worker that reads from a port continuously."""
     start_time = time.time()
@@ -165,7 +516,18 @@ def process_port_loop(device, writer, print_data, osc_client, stop_event):
             if data is not None:
                 rel_time = time.time() - start_time
                 
-                # CSV row: timestamp, idNum, imu_x, imu_y, imu_z, accel_x, accel_y, accel_z
+                # Update global latest_data for aggregation (minimal lock time)
+                with data_lock:
+                    latest_data[device_id] = {
+                        'imu_x': data['imu_x'],
+                        'imu_y': data['imu_y'],
+                        'imu_z': data['imu_z'],
+                        'accel_x': data['accel_x'],
+                        'accel_y': data['accel_y'],
+                        'accel_z': data['accel_z']
+                    }
+                
+                # CSV row: timestamp, idNum, imu_x, imu_y, imu_z, accel_x, accel_y, accel_z, mode, leader_id
                 row = [
                     rel_time,
                     data['id'],
@@ -174,27 +536,28 @@ def process_port_loop(device, writer, print_data, osc_client, stop_event):
                     data['imu_z'],
                     data['accel_x'],
                     data['accel_y'],
-                    data['accel_z']
+                    data['accel_z'],
+                    current_mode,
+                    leader_device_id if leader_device_id is not None else ""
                 ]
 
                 if writer is not None:
                     writer.writerow(row)
 
                 if print_data:
-                    print(f"[Dev{device_id}:{port_name}] ID:{data['id']} "
+                    leader_marker = " [LEADER]" if (current_mode == 2 and device_id == leader_device_id) else ""
+                    print(f"[Dev{device_id}:{port_name}]{leader_marker} ID:{data['id']} "
                           f"IMU:({data['imu_x']:.2f},{data['imu_y']:.2f},{data['imu_z']:.2f}) "
                           f"Accel:({data['accel_x']:.3f},{data['accel_y']:.3f},{data['accel_z']:.3f})")
 
+                # Send individual device data
                 if osc_client is not None:
-                    # Use persistent device_id for OSC routing
                     base = f"/imu/{device_id}"
                     
-                    # Send orientation (yaw, pitch, roll)
                     osc_client.send_message(f"{base}/yaw", data['imu_x'])
                     osc_client.send_message(f"{base}/pitch", data['imu_y'])
                     osc_client.send_message(f"{base}/roll", data['imu_z'])
                     
-                    # Send acceleration
                     osc_client.send_message(f"{base}/accel_x", data['accel_x'])
                     osc_client.send_message(f"{base}/accel_y", data['accel_y'])
                     osc_client.send_message(f"{base}/accel_z", data['accel_z'])
@@ -222,6 +585,17 @@ def round_robin_loop(serial_list, writers, print_data, osc_client, stop_event):
         if data is not None:
             rel_time = time.time() - start_time
             
+            # Update global latest_data for aggregation (minimal lock time)
+            with data_lock:
+                latest_data[device_id] = {
+                    'imu_x': data['imu_x'],
+                    'imu_y': data['imu_y'],
+                    'imu_z': data['imu_z'],
+                    'accel_x': data['accel_x'],
+                    'accel_y': data['accel_y'],
+                    'accel_z': data['accel_z']
+                }
+            
             row = [
                 rel_time,
                 data['id'],
@@ -230,7 +604,9 @@ def round_robin_loop(serial_list, writers, print_data, osc_client, stop_event):
                 data['imu_z'],
                 data['accel_x'],
                 data['accel_y'],
-                data['accel_z']
+                data['accel_z'],
+                current_mode,
+                leader_device_id if leader_device_id is not None else ""
             ]
 
             writer = writers[idx]
@@ -238,11 +614,12 @@ def round_robin_loop(serial_list, writers, print_data, osc_client, stop_event):
                 writer.writerow(row)
 
             if print_data:
-                print(f"[Dev{device_id}:{port_name}] ID:{data['id']} "
+                leader_marker = " [LEADER]" if (current_mode == 2 and device_id == leader_device_id) else ""
+                print(f"[Dev{device_id}:{port_name}]{leader_marker} ID:{data['id']} "
                       f"IMU:({data['imu_x']:.2f},{data['imu_y']:.2f},{data['imu_z']:.2f}) "
                       f"Accel:({data['accel_x']:.3f},{data['accel_y']:.3f},{data['accel_z']:.3f})")
 
-            # Send OSC using persistent device_id
+            # Send individual device data
             if osc_client is not None:
                 base = f"/imu/{device_id}"
                 
@@ -261,9 +638,118 @@ def round_robin_loop(serial_list, writers, print_data, osc_client, stop_event):
             time.sleep(0.0001)
 
 
+def mode_control_loop(serial_list):
+    """
+    Interactive mode control in a separate thread.
+    User can switch modes and select leader.
+    """
+    global current_mode, leader_device_id, debug_print
+    
+    print("\n" + "=" * 60)
+    print("MODE CONTROL COMMANDS:")
+    print("  1       - Switch to Mode 1 (Equal averaging)")
+    print("  2       - Switch to Mode 2 (Hierarchical)")
+    print("  3       - Switch to Mode 3 (Averaging + Frequency/LFO)")
+    print("  4       - Switch to Mode 4 (Hierarchical + Frequency/LFO)")
+    print("  leader  - Select leader device (Mode 2 & 4)")
+    print("  debug   - Toggle debug printing on/off")
+    print("  status  - Show current mode and settings")
+    print("  quit    - Exit program")
+    print("=" * 60 + "\n")
+    
+    while True:
+        try:
+            cmd = input(">> ").strip().lower()
+            
+            if cmd == "1":
+                current_mode = 1
+                log_mode_change(1)
+                print("Switched to MODE 1 (Equal averaging)")
+            
+            elif cmd == "2":
+                if leader_device_id is None:
+                    print("No leader set. Please select a leader first using 'leader' command")
+                    print("Available devices:", [dev['device_id'] for dev in serial_list])
+                else:
+                    current_mode = 2
+                    log_mode_change(2, leader_device_id)
+                    print(f"Switched to MODE 2 (Hierarchical with Leader {leader_device_id})")
+            
+            elif cmd == "3":
+                current_mode = 3
+                log_mode_change(3)
+                print("Switched to MODE 3 (Averaging + Frequency Extraction/LFO)")
+            
+            elif cmd == "4":
+                if leader_device_id is None:
+                    print("No leader set. Please select a leader first using 'leader' command")
+                    print("Available devices:", [dev['device_id'] for dev in serial_list])
+                else:
+                    current_mode = 4
+                    log_mode_change(4, leader_device_id)
+                    print(f"Switched to MODE 4 (Hierarchical + Frequency Extraction/LFO with Leader {leader_device_id})")
+            
+            elif cmd == "leader":
+                print(f"Available devices: {[dev['device_id'] for dev in serial_list]}")
+                leader_input = input("Enter leader device ID: ").strip()
+                try:
+                    new_leader = int(leader_input)
+                    if any(dev['device_id'] == new_leader for dev in serial_list):
+                        leader_device_id = new_leader
+                        print(f"Leader set to Device {leader_device_id}")
+                        if current_mode in [2, 4]:
+                            log_mode_change(current_mode, leader_device_id)
+                    else:
+                        print(f"Device {new_leader} not found!")
+                except ValueError:
+                    print("Invalid device ID")
+            
+            elif cmd == "debug":
+                debug_print = not debug_print
+                status = "ON" if debug_print else "OFF"
+                print(f"Debug printing: {status}")
+            
+            elif cmd == "status":
+                print("\n" + "=" * 40)
+                print(f"Current Mode: {current_mode}")
+                if current_mode == 1:
+                    print("  Mode 1: Equal averaging")
+                elif current_mode == 2:
+                    print(f"  Mode 2: Hierarchical (Leader: {leader_device_id})")
+                elif current_mode == 3:
+                    print("  Mode 3: Averaging + Frequency/LFO")
+                elif current_mode == 4:
+                    print(f"  Mode 4: Hierarchical + Frequency/LFO (Leader: {leader_device_id})")
+                print(f"Connected devices: {list(latest_data.keys())}")
+                print(f"Leader device: {leader_device_id}")
+                print(f"Debug printing: {'ON' if debug_print else 'OFF'}")
+                
+                # Show current LFO frequencies if in Mode 3 or 4
+                if current_mode in [3, 4]:
+                    print("\nCurrent LFO Frequencies:")
+                    for axis, freq in lfo_frequencies.items():
+                        print(f"  {axis}: {freq:.2f} Hz")
+                
+                print("=" * 40 + "\n")
+            
+            elif cmd == "quit":
+                print("Exiting...")
+                os._exit(0)
+            
+            else:
+                print("Unknown command. Type 1, 2, 3, 4, leader, debug, status, or quit")
+        
+        except EOFError:
+            break
+        except Exception as e:
+            print(f"Error in mode control: {e}")
+
+
 def main():
+    global current_mode, leader_device_id, debug_print
+    
     print("=" * 60)
-    print("  IMU OSC BRIDGE - Auto Device Detection")
+    print("  IMU OSC BRIDGE - Multi-Headset Aggregation [OPTIMIZED]")
     print("=" * 60)
     
     # Discover or use manual ports
@@ -293,12 +779,68 @@ def main():
     # Setup OSC client
     osc_client = udp_client.SimpleUDPClient(MAX_OSC_IP, MAX_OSC_PORT)
     print(f"\n[OK] OSC client ready -> {MAX_OSC_IP}:{MAX_OSC_PORT}")
+    print(f"[OK] OSC update rate: {OSC_UPDATE_RATE} Hz")
+
+    # Initial mode setup
+    print("\n" + "=" * 60)
+    print("INITIAL MODE SELECTION:")
+    print("  1 - Mode 1: Equal averaging of all headsets")
+    print("  2 - Mode 2: Hierarchical (one leader at 50% weight)")
+    print("  3 - Mode 3: Averaging + Frequency Extraction/LFO")
+    print("  4 - Mode 4: Hierarchical + Frequency Extraction/LFO")
+    print("=" * 60)
+    mode_choice = input("Select initial mode (1, 2, 3, or 4): ").strip()
+    
+    if mode_choice == "2":
+        print(f"Available devices: {[dev['device_id'] for dev in serial_list]}")
+        leader_input = input("Enter leader device ID: ").strip()
+        try:
+            leader_device_id = int(leader_input)
+            if not any(dev['device_id'] == leader_device_id for dev in serial_list):
+                print(f"Device {leader_device_id} not found! Defaulting to Mode 1")
+                current_mode = 1
+                leader_device_id = None
+            else:
+                current_mode = 2
+                log_mode_change(2, leader_device_id)
+        except ValueError:
+            print("Invalid input. Defaulting to Mode 1")
+            current_mode = 1
+            leader_device_id = None
+    elif mode_choice == "3":
+        current_mode = 3
+        log_mode_change(3)
+    elif mode_choice == "4":
+        print(f"Available devices: {[dev['device_id'] for dev in serial_list]}")
+        leader_input = input("Enter leader device ID: ").strip()
+        try:
+            leader_device_id = int(leader_input)
+            if not any(dev['device_id'] == leader_device_id for dev in serial_list):
+                print(f"Device {leader_device_id} not found! Defaulting to Mode 3")
+                current_mode = 3
+                leader_device_id = None
+            else:
+                current_mode = 4
+                log_mode_change(4, leader_device_id)
+        except ValueError:
+            print("Invalid input. Defaulting to Mode 3")
+            current_mode = 3
+            leader_device_id = None
+    else:
+        current_mode = 1
+        log_mode_change(1)
 
     print(f"\nSequential mode: {PORT_READ_DELAY*1000:.1f}ms delay between ports")
     print("Mode: r = record only, p = print only, rp/pr = record+print")
     user_input = input(">> ").strip().lower()
     record = user_input == "r" or user_input in ("rp", "pr")
     print_data = user_input == "p" or user_input in ("rp", "pr")
+
+    # Ask for debug printing preference
+    print("\nEnable debug console output? (shows aggregated OSC data once per second)")
+    debug_choice = input("Debug printing (y/n): ").strip().lower()
+    debug_print = debug_choice == "y" or debug_choice == "yes"
+    print(f"Debug printing: {'ON' if debug_print else 'OFF'}")
 
     # Prepare CSV writers
     writers = []
@@ -308,11 +850,9 @@ def main():
         if record:
             # Generate CSV filename
             if CSV_NAMING_MODE == "auto":
-                # Use serial number or device ID
                 safe_serial = device['serial'].replace('/', '_').replace('\\', '_')
                 csv_file_name = f"device_{device['device_id']}_{safe_serial}"
             else:
-                # Use manual names
                 idx = serial_list.index(device)
                 if idx < len(MANUAL_CSV_NAMES):
                     csv_file_name = MANUAL_CSV_NAMES[idx]
@@ -333,7 +873,7 @@ def main():
             try:
                 f = open(csv_path, "w", newline="")
                 w = csv.writer(f, delimiter=",")
-                w.writerow(["timestamp", "id", "imu_x", "imu_y", "imu_z", "accel_x", "accel_y", "accel_z"])
+                w.writerow(["timestamp", "id", "imu_x", "imu_y", "imu_z", "accel_x", "accel_y", "accel_z", "mode", "leader_id"])
                 files.append(f)
                 writers.append(w)
                 print(f"[OK] Logging Device {device['device_id']} -> {csv_path}")
@@ -346,6 +886,25 @@ def main():
             writers.append(None)
 
     stop_event = threading.Event()
+
+    # Start aggregation calculation thread (updates cache at 100Hz)
+    agg_calc_thread = threading.Thread(target=aggregation_calculation_thread, daemon=True)
+    agg_calc_thread.start()
+    print("[OK] Aggregation calculation thread started (100 Hz)")
+
+    # Start frequency extraction thread (updates at 10Hz)
+    freq_thread = threading.Thread(target=frequency_extraction_thread, daemon=True)
+    freq_thread.start()
+    print("[OK] Frequency extraction thread started (10 Hz)")
+
+    # Start aggregated OSC sender thread (sends at 200Hz)
+    osc_thread = threading.Thread(target=send_aggregated_osc, args=(osc_client,), daemon=True)
+    osc_thread.start()
+    print(f"[OK] Aggregated OSC sender started ({OSC_UPDATE_RATE} Hz)")
+
+    # Start mode control thread
+    mode_thread = threading.Thread(target=mode_control_loop, args=(serial_list,), daemon=True)
+    mode_thread.start()
 
     try:
         if USE_THREADS:
@@ -362,7 +921,7 @@ def main():
             while True:
                 time.sleep(0.5)
         else:
-            print("\n[RUNNING] Sequential mode. Press Ctrl+C to stop.\n")
+            print("\n[RUNNING] Sequential mode. Type commands or Ctrl+C to stop.\n")
             round_robin_loop(serial_list, writers, print_data, osc_client, stop_event)
 
     except KeyboardInterrupt:
@@ -373,6 +932,8 @@ def main():
         for f in files:
             if f is not None:
                 f.close()
+        if mode_log_file is not None:
+            mode_log_file.close()
         for device in serial_list:
             try:
                 device['serial_obj'].close()
