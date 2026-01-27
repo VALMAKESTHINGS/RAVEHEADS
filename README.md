@@ -9,6 +9,7 @@ Arduino → Python → Max/MSP pipeline for streaming multi-headset IMU data via
 - **Aggregates** multiple headsets with 4 different modes (averaging, hierarchical, frequency extraction)
 - **Records** data to CSV files for later analysis
 - **Maintains** persistent device IDs even when COM ports change
+- **Map** Aggregated data to a sound parameter (Cutoff Filter as an obvious example)
 - **Generates** LFO signals from motion patterns (Modes 3 & 4)
 
 ## 🆕 New Features
@@ -257,27 +258,23 @@ While the script is running, type these commands:
 ## 📊 Understanding the Modes
 
 ### Mode 1: Equal Averaging
-**Best for:** Ensemble synchronization, group movement tracking
 ```
 aggregated_value = (device1 + device2 + device3) / 3
 ```
 All headsets contribute equally to the final output.
 
 ### Mode 2: Hierarchical
-**Best for:** Leader/follower dynamics, conductor-orchestra setups
 ```
 aggregated_value = (leader * 0.5) + (others * 0.5 / num_others)
 ```
 One leader has 50% influence, others share remaining 50%.
 
 ### Mode 3: Averaging + Frequency
-**Best for:** Rhythm extraction, pattern analysis, generative music
 - Combines Mode 1 averaging
 - Extracts dominant frequencies from motion (0.1 - 10 Hz)
 - Generates synchronized LFO signals
 
 ### Mode 4: Hierarchical + Frequency
-**Best for:** Leader-driven rhythm generation, weighted pattern extraction
 - Combines Mode 2 hierarchical weighting
 - Extracts frequencies from weighted motion
 - Leader's motion patterns have stronger influence on LFO output
@@ -288,7 +285,7 @@ One leader has 50% influence, others share remaining 50%.
 - **Serial Input:** ~100Hz per device (Arduino sends every 10ms)
 - **Frequency Range:** 0.1 Hz - 10 Hz (LFO generation)
 - **Buffer Size:** 1000 samples (10 seconds at 100Hz)
-- **Max Devices:** Tested up to 12 headsets simultaneously
+- **Max Devices:** Tested up to 5 headsets simultaneously
 - **CSV Files:** Auto-saved in script directory
 - **Mode Log:** Separate log file tracks all mode changes
 - **Stop:** Press `Ctrl+C` for clean shutdown
@@ -307,7 +304,7 @@ This separation ensures stable OSC timing even during heavy computation.
 
 ## 🤠 Credits
 
-*See you space cowboy...*
+*See you cyberspace cowboy...*
 
 ---
 
