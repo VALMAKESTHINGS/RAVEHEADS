@@ -8,7 +8,7 @@
 #include "AudioTools/AudioLibs/AudioBoardStream.h"
 #include <WiFi.h>
 #include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h> // customized to prevent namespace conflict when usin async (ALL THE HTTP_XXX NOW = ASYNC_HTTP_XXX)
+#include <ESPAsyncWebServer.h>
 #include <SPIFFS.h>
 
 
@@ -16,12 +16,12 @@
 #define SAMPLE_RATE 44100
 #define CHANNELS 1
 #define BITS_PER_SAMPLE 16
-#define SINE_FREQUENCY 125  // 125Hz for yellow tac-hammer
+#define SINE_FREQUENCY 125
 
 // --- Audio objects --- //
 SineWaveGenerator<int16_t> sineWave;
 PinkNoiseGenerator<int16_t> pinkNoise;
-ADSRGain adsr(0.9f, 0.9f, 1.0f, 0.9f); // ultra short attack/decay/release & max sustain 
+ADSRGain adsr(0.9f, 0.9f, 1.0f, 0.9f);
 I2SStream i2s;
 GeneratedSoundStream<int16_t> sine(sineWave);
 GeneratedSoundStream<int16_t> noise(pinkNoise);
@@ -34,45 +34,47 @@ StreamCopy copier(i2s, effects);
 int idNum = 1;
 
 // --- ADSR Parameters --- //
-float attackTime = 0.9f; // shortest = 1 | longest = 0.0001
+float attackTime = 0.9f;
 float decayTime = 0.9f;
 float sustainLevel = 1.0f;
 float releaseTime = 0.9f;
 
 // --- Sine volume control --- //
-bool isPlaying = false; // Flag to track if soundstream is playing
-const int16_t MAX_VOLUME = 30000;  // Max amplitude = 32 767 (without clipping when on battery = ~30 000) also used for noise
+bool isPlaying = false;
+const int16_t MAX_VOLUME = 30000;
 // --- Pink noise volume control --- //
-bool isNoisePlaying = false; // Flag to track if noise is playing
+bool isNoisePlaying = false;
 
 // --- delta variables --- //
-float deltaThresh = 10.0f; // < adjust at taste (5-20 for imu) OLD METHOD for (cumulative delta)
+float deltaThresh = 10.0f;
 long deltaCurrentX, deltaCurrentY, deltaCurrentZ = 0.0;
 long cumulativeDeltaX, cumulativeDeltaY, cumulativeDeltaZ = 0;
 double prev_imu_x, prev_imu_y, prev_imu_z = 0.0;
 double delta_imu_x, delta_imu_y, delta_imu_z = 0.0;
 
 // --- Quantized trigger --- //
-float rangeMin = 0.0f;           // or -180.0f, based on your range
-float rangeMax = 360.0f;         // or 180.0f
-float triggerSpacing = 8.0f;    // degrees between each trigger (5-10 seems good)
+float rangeMin = 0.0f;
+float rangeMax = 360.0f;
+float triggerSpacing = 8.0f;
 
 int totalBins = (rangeMax - rangeMin) / triggerSpacing;
 
-static int lastTriggerBinX = -1;  // store last triggered bin
-static int lastTriggerBinY = -1;  // store last triggered bin
-static int lastTriggerBinZ = -1;  // store last triggered bin
+static int lastTriggerBinX = -1;
+static int lastTriggerBinY = -1;
+static int lastTriggerBinZ = -1;
 
 
 // --- IMU --- //
+// FIXED: Different report intervals for each sensor to prevent conflicts
+#define ORIENTATION_INTERVAL_US 5000  // 200Hz for orientation (faster)
+#define ACCEL_INTERVAL_US 10000       // 100Hz for accelerometer
+
 #ifdef FAST_MODE
-  // Top frequency is reported to be 1000Hz (but freq is somewhat variable)
   sh2_SensorId_t reportType = SH2_GYRO_INTEGRATED_RV;
   long reportIntervalUs = 2000;
 #else
-  // Top frequency is about 250Hz but this report is more accurate
   sh2_SensorId_t reportType = SH2_ARVR_STABILIZED_RV;
-  long reportIntervalUs = 5000;
+  long reportIntervalUs = ORIENTATION_INTERVAL_US;
 #endif
 
 #define BNO08X_RESET -1
@@ -85,13 +87,26 @@ struct euler_t {
   float roll;
 } ypr;
 
+// FIXED: Added data freshness tracking
 float imu_x, imu_y, imu_z;
 float accel_x, accel_y, accel_z;
+bool newOrientationData = false;
+bool newAccelData = false;
+unsigned long lastOrientationTime = 0;
+unsigned long lastAccelTime = 0;
+
+// Calibration offsets
+float imu_x_offset = 0.0f;
+float imu_y_offset = 0.0f;
+float imu_z_offset = 0.0f;
+float accel_x_offset = 0.0f;
+float accel_y_offset = 0.0f;
+float accel_z_offset = 0.0f;
 
 // Variables to track angle for each axis
 float prevAngle_x = 0.0f, prevAngle_y = 0.0f, prevAngle_z = 0.0f;
 float totalAngle_x = 0.0f, totalAngle_y = 0.0f, totalAngle_z = 0.0f;
-bool isFirstReading = true;  // Flag for the first reading
+bool isFirstReading = true;
 
 void quaternionToEuler(float qr, float qi, float qj, float qk, euler_t* ypr, bool degrees = false) {
 
@@ -134,25 +149,107 @@ uint32_t signalDuration;
 elapsedMicros pulseTimeUS = 0;
 
 // --- Print & Record variables --- //
-int printRefreshRate = 10 * 1000; // < Print time in microseconds - 10ms / 100Hz
+int printRefreshRate = 10 * 1000;
 unsigned long previousPrintMicros = 0;
-bool debugPrint = true; //  << DEBUG ON/OFF
+bool debugPrint = true;
+
+// --- Calibration function --- //
+void calibrateIMU() {
+  Serial.println("=== Starting 20-second calibration ===");
+  Serial.println("Keep the device still!");
+  
+  float sum_imu_x = 0.0f;
+  float sum_imu_y = 0.0f;
+  float sum_imu_z = 0.0f;
+  float sum_accel_x = 0.0f;
+  float sum_accel_y = 0.0f;
+  float sum_accel_z = 0.0f;
+  int sample_count = 0;
+  
+  unsigned long calibration_start = millis();
+  unsigned long last_progress = millis();
+  
+  // Flash LED to show calibration in progress
+  M5.dis.drawpix(0, 0xffff00); // Yellow during calibration
+  
+  while (millis() - calibration_start < 20000) { // 20 seconds
+    
+    // Read sensor data
+    while (bno08x.getSensorEvent(&sensorValue)) {
+      switch (sensorValue.sensorId) {
+        case SH2_ARVR_STABILIZED_RV:
+          quaternionToEulerRV(&sensorValue.un.arvrStabilizedRV, &ypr, true);
+          sum_imu_x += ypr.yaw;
+          sum_imu_y += ypr.pitch;
+          sum_imu_z += ypr.roll;
+          sample_count++;
+          break;
+          
+        case SH2_ACCELEROMETER:
+          sum_accel_x += sensorValue.un.accelerometer.x;
+          sum_accel_y += sensorValue.un.accelerometer.y;
+          sum_accel_z += sensorValue.un.accelerometer.z;
+          break;
+      }
+    }
+    
+    // Print progress every second
+    if (millis() - last_progress >= 1000) {
+      int seconds_remaining = 20 - ((millis() - calibration_start) / 1000);
+      Serial.printf("Calibrating... %d seconds remaining (samples: %d)\n", seconds_remaining, sample_count);
+      last_progress = millis();
+      
+      // Blink LED
+      if ((millis() / 500) % 2 == 0) {
+        M5.dis.drawpix(0, 0xffff00);
+      } else {
+        M5.dis.drawpix(0, 0x000000);
+      }
+    }
+    
+    delay(1);
+  }
+  
+  // Calculate averages as offsets
+  if (sample_count > 0) {
+    imu_x_offset = sum_imu_x / sample_count;
+    imu_y_offset = sum_imu_y / sample_count;
+    imu_z_offset = sum_imu_z / sample_count;
+    accel_x_offset = sum_accel_x / sample_count;
+    accel_y_offset = sum_accel_y / sample_count;
+    accel_z_offset = sum_accel_z / sample_count;
+    
+    Serial.println("=== Calibration Complete ===");
+    Serial.printf("IMU Offsets - X: %.3f, Y: %.3f, Z: %.3f\n", imu_x_offset, imu_y_offset, imu_z_offset);
+    Serial.printf("Accel Offsets - X: %.3f, Y: %.3f, Z: %.3f\n", accel_x_offset, accel_y_offset, accel_z_offset);
+    Serial.printf("Total samples collected: %d\n", sample_count);
+  } else {
+    Serial.println("WARNING: No samples collected during calibration!");
+  }
+  
+  // Flash green to show calibration done
+  for (int i = 0; i < 3; i++) {
+    M5.dis.drawpix(0, 0x00ff00);
+    delay(200);
+    M5.dis.drawpix(0, 0x000000);
+    delay(200);
+  }
+}
 
 // --- Setup --- //
 void setup() {
   millis();
   Serial.begin(115200);
-  M5.begin(true, false, true); // serial enable, i2c enable, display enable
-  M5.dis.drawpix(0, 0xff8700); // LED orange while setup
-  Wire.begin(32, 26); // sda, scl 
+  M5.begin(true, false, true);
+  M5.dis.drawpix(0, 0xff8700);
+  Wire.begin(32, 26);
   Serial.println("Beep boop, starting up");
   delay(100);
+  
   // --- Init IMU --- //
   Serial.println("Initializing BNO08x IMU...");
-  // Try to initialize!
   if (!bno08x.begin_I2C()) {
     Serial.println("Failed to find BNO08x chip");
-    // Flash red/blue to indicate IMU failure
     for (int i = 0; i < 3; i++) {
       M5.dis.drawpix(0, 0xff00ff);
       delay(200);
@@ -161,12 +258,29 @@ void setup() {
     }
   } else {
     Serial.println("BNO08x Found!");
-    setReports(reportType, reportIntervalUs);
+    setReports(reportType, ORIENTATION_INTERVAL_US);
   }
-  //bno08x.enableReport(SH2_ACCELEROMETER, reportIntervalUs); // enable bno accel reports 
-  bno08x.enableReport(SH2_ARVR_STABILIZED_RV, reportIntervalUs); // enable bno orientation reports
+  
+  // FIXED: Enable reports with different intervals
+  if (!bno08x.enableReport(SH2_ACCELEROMETER, ACCEL_INTERVAL_US)) {
+    Serial.println("Could not enable accelerometer");
+  } else {
+    Serial.println("Accelerometer enabled at 100Hz");
+  }
+  
+  if (!bno08x.enableReport(SH2_ARVR_STABILIZED_RV, ORIENTATION_INTERVAL_US)) {
+    Serial.println("Could not enable orientation");
+  } else {
+    Serial.println("Orientation enabled at 200Hz");
+  }
+  
   delay(100);
-  M5.dis.drawpix(0, 0x01ff00); // init complete, green led 
+  M5.dis.drawpix(0, 0x01ff00);
+  Serial.println("BNO08x initialization complete!");
+  
+  // Run calibration
+  calibrateIMU();
+  
   Serial.println("Setup complete. Have a nice day boss :)");
   delay(100);
 }
@@ -176,37 +290,59 @@ void loop() {
   const unsigned long nowMicros = micros();
   M5.update();
 
-  // --- IMU readings ---
-  while (bno08x.getSensorEvent(&sensorValue)) {
-
+  // FIXED: Better sensor event handling with data freshness tracking
+  int eventCount = 0;
+  const int MAX_EVENTS_PER_LOOP = 10; // Prevent infinite loop
+  
+  while (bno08x.getSensorEvent(&sensorValue) && eventCount < MAX_EVENTS_PER_LOOP) {
+    eventCount++;
+    
     switch (sensorValue.sensorId) {
 
       case SH2_ARVR_STABILIZED_RV:
         quaternionToEulerRV(&sensorValue.un.arvrStabilizedRV, &ypr, true);
-        imu_x = ypr.yaw;
-        imu_y = ypr.pitch;
-        imu_z = ypr.roll;
+        imu_x = ypr.yaw - imu_x_offset;
+        imu_y = ypr.pitch - imu_y_offset;
+        imu_z = ypr.roll - imu_z_offset;
+        newOrientationData = true;
+        lastOrientationTime = nowMicros;
         break;
 
       case SH2_ACCELEROMETER:
-        accel_x = sensorValue.un.accelerometer.x;
-        accel_y = sensorValue.un.accelerometer.y;
-        accel_z = sensorValue.un.accelerometer.z;
+        accel_x = sensorValue.un.accelerometer.x - accel_x_offset;
+        accel_y = sensorValue.un.accelerometer.y - accel_y_offset;
+        accel_z = sensorValue.un.accelerometer.z - accel_z_offset;
+        newAccelData = true;
+        lastAccelTime = nowMicros;
         break;
     }
   }
 
+  // FIXED: Check for sensor timeout (data should arrive every ~5-10ms)
+  if (nowMicros - lastOrientationTime > 50000) { // 50ms timeout
+    Serial.println("WARNING: Orientation data timeout!");
+  }
+  if (nowMicros - lastAccelTime > 50000) { // 50ms timeout
+    Serial.println("WARNING: Accelerometer data timeout!");
+  }
+
   // --- Serial print ---
   if (debugPrint && (nowMicros - previousPrintMicros >= printRefreshRate)) {
-    Serial.printf(
-      "%i,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-      idNum, imu_x, imu_y, imu_z,
-      accel_x, accel_y, accel_z
-    );
+    // FIXED: Only print when we have fresh data from both sensors
+    if (newOrientationData || newAccelData) {
+      Serial.printf(
+        "%i,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+        idNum, imu_x, imu_y, imu_z,
+        accel_x, accel_y, accel_z
+      );
+      newOrientationData = false;
+      newAccelData = false;
+    }
     previousPrintMicros = nowMicros;
   }
   
-  delay(1);
+  // FIXED: Reduced delay to prevent blocking sensor reads
+  delayMicroseconds(100); // Much shorter delay
 }
 
 
@@ -215,14 +351,14 @@ void loop() {
 /////////////////////////////////////////
 
 void GenerateGrain(float freq, bool* vibrateFlag, int16_t* amplitude_value, float* noise_amp) {
-  signalDuration = 1000 * 1000 / freq;  // in µs
+  signalDuration = 1000 * 1000 / freq;
 
-  if (isVibrating && (pulseTimeUS >= signalDuration)) { // stop pulse if flag on & time >= 1 wavelength
+  if (isVibrating && (pulseTimeUS >= signalDuration)) {
     StopPulse();
   }
 
   if (*vibrateFlag == true) {
-    if (isVibrating && (pulseTimeUS >= signalDuration)) { // emergency stop ? not sureif it actually help with anything... 
+    if (isVibrating && (pulseTimeUS >= signalDuration)) {
       StopPulse();
     }
     if(pulseTimeUS >=  signalDuration) {
@@ -235,33 +371,24 @@ void GenerateGrain(float freq, bool* vibrateFlag, int16_t* amplitude_value, floa
 void StartPulse(float freq, int16_t* amplitude_value, float* noise_amp) {
   isPlaying = true;
   adsr.keyOn();
-  //sineWave.setAmplitude(*amplitude_value);
-  //noiseGain.setVolume(*noise_amp);
   sineWave.setFrequency(freq);
-  M5.dis.drawpix(0, 0x0000ff);  // Blue when grain out
+  M5.dis.drawpix(0, 0x0000ff);
   isVibrating = true;
   pulseTimeUS = 0;
 }
 
 void StopPulse() {
-  //isPlaying = false; // << last change
   adsr.keyOff();
-  //sineWave.setAmplitude(0);
-  //noiseGain.setVolume(0.0);
-  M5.dis.drawpix(0, 0xff0000); // Red when stop
+  M5.dis.drawpix(0, 0xff0000);
   isVibrating = false;
-  M5.dis.drawpix(0, 0x01ff00); // green led when idle
+  M5.dis.drawpix(0, 0x01ff00);
   pulseTimeUS = 0;
 }
 
 void generateQuantizedTrigger(float imuAngle, int& lastTriggerBin) {
-    // Normalize angle to [rangeMin, rangeMax)
     float angle = fmod((imuAngle - rangeMin + 360.0f), 360.0f) + rangeMin;
-    
-    // Calculate current bin
     int currentBin = (int)((angle - rangeMin) / triggerSpacing);
 
-    // Trigger only if new bin is entered
     if (currentBin != lastTriggerBin) {
         shouldVibrate = true;
         lastTriggerBin = currentBin;
@@ -291,9 +418,7 @@ float mapAngle(float input) {
   return fmap(input, -180.0, 180.0, 0.0, 1.0);
 }
 
-// Function to update all three axes
 void updateTotalAngles(float current_x, float current_y, float current_z) {
-  // Skip the first reading comparison, just initialize
   if (isFirstReading) {
     prevAngle_x = current_x;
     prevAngle_y = current_y;
@@ -302,21 +427,18 @@ void updateTotalAngles(float current_x, float current_y, float current_z) {
     return;
   }
   
-  // Update X-axis
   float diff_x = current_x - prevAngle_x;
   if (diff_x > 180) diff_x -= 360;
   else if (diff_x < -180) diff_x += 360;
   totalAngle_x += diff_x;
   prevAngle_x = current_x;
   
-  // Update Y-axis
   float diff_y = current_y - prevAngle_y;
   if (diff_y > 180) diff_y -= 360;
   else if (diff_y < -180) diff_y += 360;
   totalAngle_y += diff_y;
   prevAngle_y = current_y;
   
-  // Update Z-axis
   float diff_z = current_z - prevAngle_z;
   if (diff_z > 180) diff_z -= 360;
   else if (diff_z < -180) diff_z += 360;
