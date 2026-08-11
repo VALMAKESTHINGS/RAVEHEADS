@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>RAVEHEADS Dashboard</title>
+<link rel="stylesheet" href="/css/style.css" />
+<script src="/js/vendor/socket.io.min.js"></script>
+<script src="/js/vendor/chart.umd.min.js"></script>
+<script src="/js/vendor/three.min.js"></script>
+<script src="/js/vendor/GLTFLoader.js"></script>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Sidebar -->
+  <nav id="sidebar">
+    <div class="brand">RAVEHEADS</div>
+
+    <div class="nav-section">
+      <button class="nav-btn active" data-page="global">🌐 Global</button>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Devices</div>
+      <div id="device-nav"></div>
+    </div>
+
+    <div class="nav-section" style="margin-top:auto">
+      <div class="conn-box">
+        <div id="conn-status" class="status-dot offline"></div>
+        <span id="conn-text">Disconnected</span>
+      </div>
+      <select id="port-select"></select>
+      <button id="refresh-ports">↻ Ports</button>
+      <button id="connect-btn">Connect</button>
+      <hr/>
+      <label class="small">Simulate nodes:
+        <input id="sim-count" type="number" value="3" min="1" max="10" style="width:48px"/>
+      </label>
+      <button id="simulate-btn">▶ Start Simulation</button>
+      <button id="simulate-stop-btn" disabled>■ Stop Simulation</button>
+    </div>
+  </nav>
+
+  <!-- Main content -->
+  <main id="content">
+
+    <!-- GLOBAL PAGE -->
+    <section id="page-global" class="page active">
+      <h1>Global Live View</h1>
+
+      <div class="card session-card">
+        <h2>Session Control</h2>
+        <div class="session-row">
+          <span>Audio track:</span>
+          <div id="audio-track-buttons"></div>
+          <span id="audio-duration-label">no track selected</span>
+        </div>
+        <div class="session-row">
+          <span>Pre-roll: 30s &nbsp;→&nbsp; Audio &nbsp;→&nbsp; Post-roll: 30s</span>
+        </div>
+        <div class="session-row">
+          <button id="start-session-btn" disabled>▶ Start Session (3:00 total)</button>
+          <button id="stop-session-btn" disabled>■ Abort</button>
+          <div id="session-phase-badge" class="phase-badge idle">idle</div>
+        </div>
+        <div class="session-row">
+          <div id="session-progress-outer"><div id="session-progress-inner"></div></div>
+          <span id="session-time-label">--:--</span>
+        </div>
+        <audio id="audio-player"></audio>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>Devices</h2>
+          <table id="device-table">
+            <thead><tr><th>Node</th><th>Status</th><th>Hz</th><th>Yaw</th><th>Pitch</th><th>Roll</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>Aggregate Orientation (mean ± dispersion)</h2>
+          <canvas id="aggregate-chart" height="220"></canvas>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Collective Heading (all devices)</h2>
+        <canvas id="global-yaw-chart" height="140"></canvas>
+      </div>
+    </section>
+
+    <!-- Device page template lives in JS (cloned per node) -->
+    <div id="device-page-template" class="page" style="display:none">
+      <h1>Device <span class="dev-title-id"></span></h1>
+      <div class="grid-2">
+        <div class="card">
+          <h2>3D Orientation</h2>
+          <div class="three-container"></div>
+        </div>
+        <div class="card">
+          <h2>Live Values</h2>
+          <div class="ypr-readout">
+            <div>Yaw <span class="val yaw-val">0.0</span>°</div>
+            <div>Pitch <span class="val pitch-val">0.0</span>°</div>
+            <div>Roll <span class="val roll-val">0.0</span>°</div>
+          </div>
+          <div class="ypr-meta">
+            <div>Status: <span class="meta-status">offline</span></div>
+            <div>Rate: <span class="meta-hz">0</span> Hz</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Yaw / Pitch / Roll over time</h2>
+        <canvas class="ypr-chart" height="160"></canvas>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
