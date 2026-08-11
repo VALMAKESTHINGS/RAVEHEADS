@@ -1,5 +1,5 @@
 /*
- * hub.ino  –  ESP-NOW Communication Hub (star topology)
+ * Receiver.ino  –  ESP-NOW Communication Hub (star topology)
  *
  * Architecture (dual-core):
  *   Core 0 – ESP-NOW RX callback  +  TX broadcast task
@@ -18,19 +18,24 @@
 #include <WiFi.h>
 
 // ── Payload definitions (must match sender.ino exactly) ────────────────────────
+// mirrors sender.ino's `Packet` struct byte-for-byte —
+// nodeId(1) + timestamp_ms(4) + yaw/pitch/roll as float32(4 each) = 17 bytes,
+// no seqNum (sender.ino never sends one). Previously this struct used int16
+// for yaw/pitch/roll and included a seqNum, which did NOT match what
+// sender.ino actually transmits (float32, no seqNum) — so the receive side
+// was reinterpreting float bytes as unrelated int16s.
 typedef struct __attribute__((packed)) {
     uint8_t  nodeId;
     uint32_t timestamp_ms;
-    int16_t  yaw;
-    int16_t  pitch;
-    int16_t  roll;
-    uint8_t  seqNum;
+    float    yaw;
+    float    pitch;
+    float    roll;
 } NodePayload;
 
 typedef struct __attribute__((packed)) {
     uint8_t  fromNodeId;
     uint32_t hubTimestamp_ms;
-    int16_t  broadcastValue;
+    float    broadcastValue;   // FIXED: was int16_t, now float to match NodePayload.yaw's real precision
 } HubBroadcast;
 
 // ── Max senders the hub tracks ─────────────────────────────────────────────────
@@ -173,15 +178,18 @@ void loop() {
     // Drain all pending received packets
     while (xQueueReceive(rxQueue, &in, 0) == pdTRUE) {
 
+        // FIXED: %d -> %.2f since yaw/pitch/roll are now floats, not ints
         Serial.printf(
-            "[RX] node=%u seq=%u yaw=%d pitch=%d roll=%d t=%lu\n",
+            "[RX] node=%u yaw=%.2f pitch=%.2f roll=%.2f t=%lu\n",
             in.nodeId,
-            in.seqNum,
             in.yaw,
             in.pitch,
             in.roll,
             in.timestamp_ms
         );
+
+        // Forward this packet to the PC over USB serial (framed + CRC'd)
+        send_framed(&in);
 
         HubBroadcast reply;
         reply.fromNodeId      = in.nodeId;
